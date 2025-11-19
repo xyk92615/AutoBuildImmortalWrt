@@ -52,68 +52,100 @@ on:
         required: false
 
 jobs:
-    build_installer_iso:
-      runs-on: ubuntu-22.04
-      needs: build_immortalwrt
+  build_immortalwrt:
+    runs-on: ubuntu-22.04
 
-      steps:
-        - name: Download firmware artifact
-          uses: actions/download-artifact@v4
-          with:
-            name: firmware-img
-  
-        - name: ⏬ 同步 img-installer 项目 准备制作ISO
-          run: |
-            git clone https://github.com/wukongdaily/img-installer.git
-            cd img-installer
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-        - name: Set executable permissions for scripts
-          run: |
-            chmod +x "${{ github.workspace }}/img-installer/custom.sh"
-            chmod +x "${{ github.workspace }}/img-installer/supportFiles/custom/build.sh"
+      - name: Set executable permissions
+        run: chmod +x ${{ github.workspace }}/x86-64/build24.sh
+      
+      - name: Enable Store integration
+        run: |
+          if [ "${{ github.event.inputs.enable_store }}" == "true" ]; then
+            echo 'CUSTOM_PACKAGES="$CUSTOM_PACKAGES luci-app-store"' >> shell/custom-packages.sh
+            echo "✅ 已追加 luci-app-store"
+          else
+            echo "❎ 未启用 luci-app-store"
+          fi
 
-        - name: ✅ 制作 ISO
-          run: |
-            firmware_file=$(ls *squashfs-combined-efi.img.gz)
-            cd img-installer
-            bash autobuild/autobuild.sh "../$firmware_file"
-
-        # 👉 新增：根据参数和时间生成 tag
-        - name: 🔧 生成 Release Tag
-          id: set_tag
-          run: |
-            LUCI_VERSION="${{ github.event.inputs.luci_version }}"
-            PROFILE="${{ github.event.inputs.profile }}"
-            INCLUDE_DOCKER="${{ github.event.inputs.include_docker }}"
-            ENABLE_STORE="${{ github.event.inputs.enable_store }}"
-
-            # Docker 标志
-            if [ "$INCLUDE_DOCKER" = "yes" ]; then
-              DOCKER_FLAG="Docker"
-            else
-              DOCKER_FLAG="NoDocker"
+      - name: Validate PPPoE Inputs
+        run: |
+          if [[ "${{ github.event.inputs.enable_pppoe }}" == "yes" ]]; then
+            if [[ -z "${{ github.event.inputs.pppoe_account }}" || -z "${{ github.event.inputs.pppoe_password }}" ]]; then
+              echo "Error: PPPoE account and password must be provided when PPPoE is enabled!"
+              exit 1
             fi
+          fi
 
-            # Store 标志（boolean: true/false）
-            if [ "$ENABLE_STORE" = "true" ]; then
-              STORE_FLAG="Store"
-            else
-              STORE_FLAG="NoStore"
-            fi
+      - name: ✅ 正在构建ImmortalWrt固件
+        run: |
+          profiles="${{ github.event.inputs.profile }}"
+          include_docker="${{ github.event.inputs.include_docker }}"
+          luci_version="${{ github.event.inputs.luci_version }}"
+          IFS=',' read -r -a profile_array <<< "$profiles"
+          
+          for profile in "${profile_array[@]}"; do
+            echo "Building for profile: $profile"
+            docker run --rm -i \
+              --user root \
+              -v "${{ github.workspace }}/bin:/home/build/immortalwrt/bin" \
+              -v "${{ github.workspace }}/files:/home/build/immortalwrt/files" \
+              -v "${{ github.workspace }}/x86-64/imm.config:/home/build/immortalwrt/.config" \
+              -v "${{ github.workspace }}/shell:/home/build/immortalwrt/shell" \
+              -v "${{ github.workspace }}/x86-64/build24.sh:/home/build/immortalwrt/build.sh" \
+              -e PROFILE=$profile \
+              -e INCLUDE_DOCKER=$include_docker \
+              -e ENABLE_PPPOE=${{ inputs.enable_pppoe }} \
+              -e PPPOE_ACCOUNT=${{ inputs.pppoe_account }} \
+              -e PPPOE_PASSWORD=${{ inputs.pppoe_password }} \
+              immortalwrt/imagebuilder:x86-64-openwrt-${luci_version} /bin/bash /home/build/immortalwrt/build.sh
+          done
 
-            # 日期时间：202511190101 这种格式
-            DATE="$(date +'%Y%m%d%H%M')"
-  
-            TAG="Custom-Installer-x86_64-ISO_${LUCI_VERSION}_${PROFILE}M_${DOCKER_FLAG}_${STORE_FLAG}_${DATE}"
-  
-            echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
+      - name: ✅ 复制固件到根目录
+        run: |
+          cp ${{ github.workspace }}/bin/targets/x86/64/*squashfs-combined-efi.img.gz ${{ github.workspace }}
 
-        - name: 🚀 上传 ISO 到 Release
-          uses: softprops/action-gh-release@v2.2.1
-          with:
-            tag_name: ${{ steps.set_tag.outputs.tag_name }}   # 👈 使用上一步生成的 tag
-            name: ${{ steps.set_tag.outputs.tag_name }}       # 可选：Release 名称也用同一个
-            body_path: "${{ github.workspace }}/img-installer/autobuild/info.md"
-            files: |
-              img-installer/output/custom-installer-x86_64.iso
-            token: "${{ secrets.GITHUB_TOKEN }}"
+      - name: ✅ 上传固件到 artifact (for ISO generation)
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-img
+          path: |
+            *.img.gz
+
+  build_installer_iso:
+    runs-on: ubuntu-22.04
+    needs: build_immortalwrt
+
+    steps:
+      - name: Download firmware artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware-img
+
+      - name: ⏬ 同步 img-installer 项目 准备制作ISO
+        run: |
+          git clone https://github.com/wukongdaily/img-installer.git
+          cd img-installer
+
+      - name: Set executable permissions for scripts
+        run: |
+          chmod +x "${{ github.workspace }}/img-installer/custom.sh"
+          chmod +x "${{ github.workspace }}/img-installer/supportFiles/custom/build.sh"
+
+      - name: ✅ 制作 ISO
+        run: |
+          firmware_file=$(ls *squashfs-combined-efi.img.gz)
+          cd img-installer
+          bash autobuild/autobuild.sh "../$firmware_file"
+
+      - name: 🚀 上传 ISO 到 Release
+        uses: softprops/action-gh-release@v2.2.1
+        with:
+          tag_name: "Custom-Installer-x86_64-ISO"
+          body_path: "${{ github.workspace }}/img-installer/autobuild/info.md"
+          files: |
+            img-installer/output/custom-installer-x86_64.iso
+          token: "${{ secrets.GITHUB_TOKEN }}"
